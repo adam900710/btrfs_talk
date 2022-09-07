@@ -17,7 +17,7 @@ In this talk, I'll go through the rabbit holes of:
 
 - RAID56 in generic
 
-  Not an expert here, Neil Brown would provide more details on this top.
+  Not an expert here, Neil Brown would provide more details on this topic.
   Thus this would really be a simple introduction to the RAID56 features used
   in btrfs.
 
@@ -136,7 +136,7 @@ It sounds pretty simple so far, then what can go wrong?
   In theory we have the extra parity stripe(s) which can help us to recovery
   the data.
 
-  But which one is correct?
+  But how to determine which one is correct/corrupted?
 
 - Destructive read-modify-write (RMW)
 
@@ -144,7 +144,7 @@ It sounds pretty simple so far, then what can go wrong?
   (at least the untouched part), modify the data and update the parity, then
   write all the new data stripe and parity to disk.
 
-  But what if above rotten bit is there?
+  But what if we also have rotten bits?
 
 ```
     Disk 1 :   | Good data 1 | Good data 4 |
@@ -198,6 +198,7 @@ in RAID5 mode, like this:
 This is not going to feel good...
 
 - Write-hole
+
   This is exactly the same problem of data synchronization problem.
 
   And unfortunately we don't have any upstream solution.
@@ -330,8 +331,14 @@ The nature of zoned devices makes the following thing much harder
 
 - How to do journal/write-intent to synchronize the devices?
 
-  The answer is mostly no, we can not.
-  So the traditional write-intent bitmap or journal is out of question.
+  No overwrite thus it is not suitable to go the original write-intent
+  bitmap/journal.
+
+  There is still a small chance, going ring buffer write-intent/journal
+  into two dedicated zones.
+
+  But the real world zoned devices have more limitations, they have limited
+  amount of opened zones, extra zones can be too expensive or just impossible.
 
 - How to do proper data writes?
 
@@ -361,51 +368,66 @@ Remember that parity got a much frequent update?
 Let's see an example using 64K stripe length (data and parity stripe length),
 and doing 48K sync write with 16K block size..
 
-We write the first 16K:
+We write the first 4 16K:
 
 ```
 XXX: Used space.
 
                0     16K   32K   48K   64K
-    Disk 1 :   |XXXXX|     |     |     | Data stripe 1
+    Disk 1 :   |XXXXX|XXXXX|XXXXX|XXXXX| Data stripe 1
     Disk 2 :   |     |     |     |     | Data stripe 2
     Disk 3 :   |     |     |     |     | Data stripe 3
-    Disk 4 :   |XXXXX|     |     |     | Parity stripe
+    Disk 4 :   |XXXXX|XXXXX|XXXXX|XXXXX| Parity stripe
 ```
 
-So far so good, but when we write the 2nd 16K, things are not going well now:
+So far so good, nothing much different than regular RAID56.
+
+But what about the next 16K block?
 
 ```
                0     16K   32K   48K   64K
-    Disk 1 :   |XXXXX|     |     |     | Data stripe 1
-    Disk 2 :   |XXXXX|     |     |     | Data stripe 2
+    Disk 1 :   |XXXXX|XXXXX|XXXXX|XXXXX| Data stripe 1
+    Disk 2 :   |?????|     |     |     | Data stripe 2
     Disk 3 :   |     |     |     |     | Data stripe 3
-    Disk 4 :   |XXXXX|XXXXX|     |     | Parity stripe
+    Disk 4 :   |XXXXX|XXXXX|XXXXX|XXXXX| Parity stripe
+                ?????
 ```
 
-Now the writer pointer for parity stripe is already moved 32K forward.
+Normally we should update the 16K block on Disk 2, and update overwrite
+the first block of Disk 4.
 
-Now comes to the final block:
+But this is zoned device, we can not write before your write pointer.
 
-```
-               0     16K   32K   48K   64K
-    Disk 1 :   |XXXXX|     |     |     | Data stripe 1
-    Disk 2 :   |XXXXX|     |     |     | Data stripe 2
-    Disk 3 :   |XXXXX|     |     |     | Data stripe 3
-    Disk 4 :   |XXXXX|XXXXX|XXXXX|     | Parity stripe
-```
+Now we have to make some hard calls, by either:
 
-Yeah, the curse of parity stripe can not be avoided.
+- Mark the full stripe full
 
-For the worst case, we can only write 1 / (nr data stripes) for a RAID5 chunk
-using zoned device.
+  As two device have exhausted their allocated space.
 
-Users won't be happy if they have spent tons of money to get a fancy zoned array,
-then found out it it can only handle RAID56 as poor as above cases.
+- Write the new block to unused space in Disk 2/3
+
+  Since we have RST, in theory we can write the data to any disk,
+  ignoring the strict RAID56 rotation.
 
 
-Although not all hope is lost, for btrfs zoned mode, there are reserved zones,
-and automatic zones reclaim mechanism.
+But either way, there are obvious problems:
+
+- Mark the full stripe full
+
+  Super bad space efficiency.
+
+  We can only write 64K into a full stripe which is supposed to be 3 * 64K.
+
+- Write the new block to unused space of other disks
+
+  Then one day we may have a data block and its corresponding parity on the
+  same disk!
+
+  Then we can no longer tolerant one missing device.
+
+
+Although not all hope is lost for the first case, for btrfs zoned mode, there
+are reserved zones, and automatic zones reclaim mechanism.
 
 That means, for above block groups with parity zone already exhausted, btrfs
 can read it out and write into another block group (of course, writing them
@@ -422,8 +444,10 @@ So there seems to be a spectrum of methods to solve RAID56 problems so far:
 (Definitely unrelated to politics)
 
 ```
-  The progressive		          The conserative
-  |<--                                    -->|
+                        /- Will there be some good middle ground?
+                        |
+  The progressive       |                    The conserative
+  |<--                  |                 -->|
   |                                          \- Use traditional solution
   |                                             like journal/write-intent
   |                                             to solve RAID56 problems on
@@ -443,9 +467,13 @@ submitted for write-intent bitmap support for btrfs.
 And no new cause of ENOSPC at all.
 But that means, zoned devices are completely ignored.
 
-
 Personally speaking, I have seen too many flops chasing one-fit-all solutions.
 Like the initial GNOME 3 and Windows 8 for touchscreen.
 
 Thus I'm willing to go split ways to solve the same problems, until we really
 got a silver bullet (that a big IF though).
+
+There is also some new ideas, like some extra encoding for the data (like
+compression), but can stand a big chunk of missing data.
+
+But no really suitable solution for now.
