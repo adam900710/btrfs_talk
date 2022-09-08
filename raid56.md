@@ -3,11 +3,19 @@ title: New challenges for old tricks - RAID56 in BTRFS
 author:
 - Qu Wenruo <wqu@suse.com>
 
+# Introduction
+
+This talk is about the RAID56 feature in Btrfs, which is not having a good
+reputation for long time.
+
+I'll talk about the original idea of RAID56, its pitfall, and the new
+challenges we're already facing specifically in btrfs RAID56.
+
 # Background
 
-Although Btrfs is already the default filesystem for root for a long long time,
-and also the default filesystem for Fedora recently, there is a not-so-small
-chunk of feature completely truncated from SLE kernel: RAID56.
+Although Btrfs is already the default root filesystem of SLE/opensuse for a
+long long time, and also the default filesystem for Fedora recently,
+there is a not-so-small chunk of feature completely truncated from SLE kernel: RAID56.
 
 Unsurprisingly btrfs RAID56 is also marked as unsafe in the upstream
 documentation:
@@ -15,11 +23,11 @@ documentation:
 
 In this talk, I'll go through the rabbit holes of:
 
-- RAID56 in generic
+- RAID56 in general
 
-  Not an expert here, Neil Brown would provide more details on this topic.
-  Thus this would really be a simple introduction to the RAID56 features used
-  in btrfs.
+  Not an expert here, Neil Brown would be the expert here.
+
+  Thus this would really be a simple introduction to the RAID56 idea.
 
 - RAID56 in btrfs
 
@@ -29,12 +37,12 @@ In this talk, I'll go through the rabbit holes of:
 
   This involves zoned devices (including the infamous consumer level SMR disks).
 
-# RAID56 in generic (the light side)
+# RAID56 in generic (the good)
 
 ## RAID4
 
 Although RAID4 is not utilized by btrfs, it provides a very good basis to explain
-the whole RAID456 family.
+the whole RAID456 family, thus I'd like to start with RAID4 first.
 
 The idea itself is pretty straightforward:
 
@@ -47,6 +55,10 @@ The idea itself is pretty straightforward:
 
 In above example, `Disk 4` is always storing the parity, which is the XOR result
 of all the data stripes in the same vertical stripe.
+
+And all stripes, including data and parity, are in the same size.
+(mdraid5 goes 512K by default, while btrfs is fixed to 64K)
+
 While for disk 1~3, it's no different than RAID0.
 
 TLDR: RAID4 is RAID0 plus one dedicated device storing the parity.
@@ -57,9 +69,7 @@ If we lost one of disk 1~3, we can recover the data by XOR parity and the
 remaining data stripes.
 If we lost disk 4, there is no immediate data loss anyway.
 
-Thus for RAID4, we can tolerate one missing device.
-
-*OR DO WE?*
+Thus for RAID4, we can always tolerate one missing device.
 
 ## RAID5
 
@@ -74,19 +84,20 @@ Then we come to RAID5:
 
 Initially for the first vertical stripe, it looks no different than RAID4.
 But when comes to the next vertical stripe, it's different.
+
 There is a *ROTATION*!
 
-
-This in fact addresses one of the sin of RAID56, parity update.
+This in fact addresses one of the bottleneck of RAID4, parity update.
 
 Since parity is the XOR of all data blocks, if any data block gets updated,
 parity stripe has to be updated too.
 
-For RAID4, if we just touched data block 1, 2, 3 sequentially, every time we
-touch the data block, parity also has to be update, meaning it's updated
-way more frequently than data stripes.
+For RAID4, if we just update data block 1, sync, update data block 2, sync,
+and finally update data block 3 and sync.
+Although we only touched data blocks 1~3 each once, we have to update parity 3 times.
+
 This can lead to a performance bottleneck, thus RAID5 distribute the parity
-stripes across all devices, to also distribute the parity update loads.
+stripes across all devices, to distribute the parity update loads.
 
 But remember this, it will come back to bite us again.
 
@@ -109,11 +120,14 @@ P is still calculated the same as RAID5.
 But Q is more complex, for the details of such black magic, just go check the
 wikipedia page: [https://en.wikipedia.org/wiki/Standard_RAID_levels]
 
-# RAID56 in generic (the dark side)
+RAID6 has a more complex recovery schema, but TLDR is, RAID6 can tolerate 2
+missing devices.
+
+# RAID56 in generic (the bad)
 
 It sounds pretty simple so far, then what can go wrong?
 
-- Data synchronization
+- Multi-device Data synchronization
 
   One can not expect data and parity stripes can always reach disk at the same
   time. What if only parity is updated then a power loss happened?
@@ -132,7 +146,8 @@ It sounds pretty simple so far, then what can go wrong?
 
 - Rotten bit
 
-  If one or more bits inside data or parity stripes is rotten?
+  What if one or more bits inside data or parity stripes is rotten?
+
   In theory we have the extra parity stripe(s) which can help us to recovery
   the data.
 
@@ -141,7 +156,7 @@ It sounds pretty simple so far, then what can go wrong?
 - Destructive read-modify-write (RMW)
 
   Obviously we have to update a RAID56 full stripe by reading out all the data
-  (at least the untouched part), modify the data and update the parity, then
+  (at least the untouched part), calculate the new parity, then
   write all the new data stripe and parity to disk.
 
   But what if we also have rotten bits?
@@ -175,7 +190,7 @@ It sounds pretty simple so far, then what can go wrong?
 
 Btrfs handles various RAID profiles in a block group by block group base.
 
-This means, btrfs can have one block group in RAID1 mode, while another one
+This means, btrfs can have block groups in RAID1 mode, while some others 
 in RAID5 mode, like this:
 
 ```
@@ -193,11 +208,15 @@ in RAID5 mode, like this:
                Devid 2 Physical Y2
 ```
 
+Normally we go higher duplication profile for metadata, and lower duplication
+profile for data.
+
+E.g. by default btrfs go RAID1 for metadata and RAID0 for data for
+multi-device mkfs.
+
 ## Bugs related to BTRFS RAID56
 
-This is not going to feel good...
-
-- Write-hole
+- Write-hole (aka, multi-device data synchronization problem)
 
   This is exactly the same problem of data synchronization problem.
 
@@ -213,15 +232,19 @@ This is not going to feel good...
   Just try to mkfs on an PowerPC/Aarch64 with 64K page size, then try
   to mount it with a x86_64 system.
 
+  Such fs will not be mountable on x86_64, as they are using 64K sector size
+  (block size in other filesystems).
+
   Other filesystems address this by having subpage support, meaning
   they can have block size smaller than page size.
   Thus for PowerPC or 64K page sized Aarch64, they can handle block size
   (normally 4K, created by x86_64) smaller than their page size.
 
-  (On the other hand, they can not handle blocksize larger than page size,
-   just like recent btrfs).
+  On the other hand, they can not handle blocksize larger than page size,
+  just like recent btrfs.
 
-  Thankfully RAID56 part is addressed in v5.19.
+  Thankfully subpage support (excluding RAID56) is upstreamed by v5.16,
+  and RAID56 subpage support is added in v5.19.
 
 - Over-updated parity
 
@@ -244,10 +267,11 @@ But not everything is bad, we had one thing to save our backend:
 
 - Checksum
 
-  If the rotten bit happens in a data stripe, and we're reading that corrupted
+  Now if the rotten bit happens in a data stripe, and we're reading that corrupted
   sector, and we have checksum for it.
 
   Then we can recover!
+
 
 Furthermore, since btrfs has checksum for all of its metadata and part of the data
 (default to have data checksum, but can be disabled), in the future we can
@@ -264,7 +288,7 @@ Tapes sound old (well it's still in-use today), but it's going to bite us now, j
 in a different name: zoned devices.
 
 Zoned devices are recently pushed by WDC, and our old friend Johannes Thumshirn
-<Johannes.Thumshirn@wdc.com> actively working on that.
+<Johannes.Thumshirn@wdc.com> is actively working on that.
 
 So what's zoned device in the first place?
 [https://zonedstorage.io/docs/introduction/zoned-storage]
@@ -278,9 +302,9 @@ The tape part is:
   If some data is written, one can not overwrite that data, at least not
   directly.
 
-- There will be a write pointer indicating the next write position
+- All write will mostly be issued at the end of last written position
 
-  Just like the tape head.
+  Just like a tape head.
 
 The enhanced part is:
 
@@ -294,7 +318,7 @@ The enhanced part is:
   sounds awesome right?
   Well, the number of opened zones for write has limits (7 for WDC zoned devices?)
 
-- You can still do write with queue depth larger than 1
+- Can do concurrency writes (queue depth > 1)
 
   But this comes with a drawback, one can not really know where the
   data is going to be written.
@@ -314,12 +338,12 @@ Currently btrfs (and f2fs?) are the only two filesystems supporting zoned device
 The COW nature of btrfs makes it a perfect match, CoW converts the metadata updates
 into sequential write with queue depth 1.
 
-While for cases of non-COW data writes (from prealloc to NODATACOW files), btrfs just
-rejects them on zoned device.
-
-For other CoW based data write, we go queue depth >1, and catch the returned
+For CoW based data write, we go queue depth > 1, and catch the returned
 bytenr from the zoned device, record them into metadata, then rely on above
 mentioned metadata writeback behavior.
+
+While for cases of non-COW data writes (from prealloc to NODATACOW files), btrfs just
+rejects them on zoned device.
 
 But why this would bother RAID56?
 
@@ -339,6 +363,10 @@ The nature of zoned devices makes the following thing much harder
 
   But the real world zoned devices have more limitations, they have limited
   amount of opened zones, extra zones can be too expensive or just impossible.
+
+
+  The other solution is get rid of write-intent/journal completely by COW, but
+  it will have more problems later.
 
 - How to do proper data writes?
 
@@ -361,12 +389,12 @@ This would work pretty well for data chunks with RAID0/1/10.
 
 But what about RAID56?
 
-### The parity strikes back
+### The parity update dilemma
 
 Remember that parity got a much frequent update?
 
 Let's see an example using 64K stripe length (data and parity stripe length),
-and doing 48K sync write with 16K block size..
+and doing sync write with 16K block size..
 
 We write the first 4 16K:
 
@@ -425,6 +453,9 @@ But either way, there are obvious problems:
 
   Then we can no longer tolerant one missing device.
 
+  And even we avoided the device conflicts, we're no better than RAID1, still
+  need to waste a lot of storage space.
+
 
 Although not all hope is lost for the first case, for btrfs zoned mode, there
 are reserved zones, and automatic zones reclaim mechanism.
@@ -438,7 +469,7 @@ all the data on one data stripes, and try to write data back.
 
 No to mention ENOSPC problems of btrfs is already somewhat infamous.
 
-## The last call (BBS)
+## The hard call
 
 So there seems to be a spectrum of methods to solve RAID56 problems so far:
 (Definitely unrelated to politics)
@@ -477,3 +508,16 @@ There is also some new ideas, like some extra encoding for the data (like
 compression), but can stand a big chunk of missing data.
 
 But no really suitable solution for now.
+
+# TL;DR
+
+1. RAID56 idea is old and the idea itself looks simple
+
+2. But there are hidden pitfalls needs to be addressed
+
+3. Btrfs has its problems related to RAID56, and is improving
+
+4. Zoned device support will be a new, btrfs-only challenge
+
+
+# Q&A time
